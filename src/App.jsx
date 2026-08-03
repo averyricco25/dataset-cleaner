@@ -55,7 +55,7 @@ function parseName(row, normHeaders, rawHeaders) {
   // More specific patterns first, and exclude fnKey/lnKey to avoid matching those again
   const fullKey = findCol(normHeaders.filter((h, i) => h !== fnKey && h !== lnKey), ['display_name', 'displayname', 'organization_name', 'business_name', 'org_name', 'company_name', 'business', 'full_name', 'fullname', 'contact_name', 'customer_name', 'client_name', 'name'])
   if (fullKey && row[fullKey]) {
-    const full = firstValue(row[fullKey])
+    const full = String(row[fullKey]).trim()
 
     // Check if it's a comma-separated name (likely "Last, First")
     if (full.includes(',')) {
