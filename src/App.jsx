@@ -88,14 +88,23 @@ function parseName(row, normHeaders, rawHeaders) {
   return { first_name: '', last_name: '' }
 }
 
-function isTagColumn(header) {
-  return /tag|label|category|group|segment/i.test(header)
+function getExtraCols(rawHeaders, normHeaders) {
+  const fnKey = findCol(normHeaders, ['first_name', 'firstname', 'first', 'fname', 'given_name'])
+  const lnKey = findCol(normHeaders, ['last_name', 'lastname', 'last', 'lname', 'surname', 'family_name'])
+  const fullKey = findCol(
+    normHeaders.filter(h => h !== fnKey && h !== lnKey),
+    ['display_name', 'displayname', 'organization_name', 'business_name', 'org_name', 'company_name', 'business', 'full_name', 'fullname', 'contact_name', 'customer_name', 'client_name', 'name']
+  )
+  const phoneKey = findCol(normHeaders, ['phone', 'phone_number', 'phonenumber', 'mobile', 'cell', 'telephone', 'cell_phone', 'mobile_phone', 'contact_phone'])
+  const emailKey = findCol(normHeaders, ['email', 'email_address', 'emailaddress', 'e_mail'])
+  const coreNormKeys = new Set([fnKey, lnKey, fullKey, phoneKey, emailKey].filter(Boolean))
+  return rawHeaders
+    .map((raw, i) => ({ raw, norm: normHeaders[i] }))
+    .filter(({ norm }) => !coreNormKeys.has(norm))
 }
 
-function cleanData(rows, rawHeaders, keepTagCols, prioritizeEmail) {
+function cleanData(rows, rawHeaders, extraColsToKeep, prioritizeEmail) {
   const normHeaders = rawHeaders.map(normalizeHeader)
-  const tagCols = rawHeaders.filter((_, i) => isTagColumn(normHeaders[i]))
-  const tagColsNorm = tagCols.map(normalizeHeader)
 
   const summary = {
     started: rows.length,
@@ -165,17 +174,15 @@ function cleanData(rows, rawHeaders, keepTagCols, prioritizeEmail) {
 
     const out = { first_name, last_name, phone, email }
 
-    if (keepTagCols) {
-      tagColsNorm.forEach(tc => {
-        out[tc] = firstValue(row[tc] || '')
-      })
-    }
+    extraColsToKeep.forEach(col => {
+      out[col.raw] = firstValue(String(row[col.norm] ?? ''))
+    })
 
     cleaned.push(out)
   }
 
   summary.final = cleaned.length
-  return { cleaned, removed, summary, tagCols }
+  return { cleaned, removed, summary }
 }
 
 function exportCSV(data, filename) {
@@ -198,14 +205,14 @@ function exportXLSX(data, filename) {
 }
 
 export default function App() {
-  const [stage, setStage] = useState('upload') // upload | tag-confirm | result
+  const [stage, setStage] = useState('upload') // upload | extra-cols | result
   const [dragOver, setDragOver] = useState(false)
   const [fileName, setFileName] = useState('')
   const [selectedFile, setSelectedFile] = useState(null)
   const [rawRows, setRawRows] = useState([])
   const [rawHeaders, setRawHeaders] = useState([])
-  const [detectedTagCols, setDetectedTagCols] = useState([])
-  const [keepTags, setKeepTags] = useState(true)
+  const [extraCols, setExtraCols] = useState([])
+  const [selectedExtraCols, setSelectedExtraCols] = useState(new Set())
   const [prioritizeEmail, setPrioritizeEmail] = useState(false)
   const [cleanedRows, setCleanedRows] = useState([])
   const [removedRows, setRemovedRows] = useState([])
@@ -258,13 +265,14 @@ export default function App() {
     setRawHeaders(headers)
 
     const normHeaders = headers.map(normalizeHeader)
-    const tagCols = headers.filter((_, i) => isTagColumn(normHeaders[i]))
-    setDetectedTagCols(tagCols)
+    const cols = getExtraCols(headers, normHeaders)
+    setExtraCols(cols)
 
-    if (tagCols.length > 0) {
-      setStage('tag-confirm')
+    if (cols.length > 0) {
+      setSelectedExtraCols(new Set(cols.map(c => c.norm)))
+      setStage('extra-cols')
     } else {
-      const { cleaned, removed, summary } = cleanData(rows, headers, false, prioritizeEmail)
+      const { cleaned, removed, summary } = cleanData(rows, headers, [], prioritizeEmail)
       setCleanedRows(cleaned)
       setRemovedRows(removed)
       setSummary(summary)
@@ -284,9 +292,10 @@ export default function App() {
     if (file) parseFile(file)
   }
 
-  const confirmTags = (keep) => {
-    setKeepTags(keep)
-    const { cleaned, removed, summary } = cleanData(rawRows, rawHeaders, keep, prioritizeEmail)
+  const confirmExtraCols = (overrideSelection) => {
+    const sel = overrideSelection ?? selectedExtraCols
+    const toKeep = extraCols.filter(c => sel.has(c.norm))
+    const { cleaned, removed, summary } = cleanData(rawRows, rawHeaders, toKeep, prioritizeEmail)
     setCleanedRows(cleaned)
     setRemovedRows(removed)
     setSummary(summary)
@@ -308,6 +317,8 @@ export default function App() {
     setFileName('')
     setRawRows([])
     setRawHeaders([])
+    setExtraCols([])
+    setSelectedExtraCols(new Set())
     setCleanedRows([])
     setRemovedRows([])
     setSummary(null)
@@ -419,19 +430,33 @@ export default function App() {
           </div>
         )}
 
-        {stage === 'tag-confirm' && (
+        {stage === 'extra-cols' && (
           <div className="card tag-card">
-            <h2>Tag columns detected</h2>
-            <p className="hint">The following columns look like tags or labels:</p>
-            <div className="tag-cols">
-              {detectedTagCols.map(c => (
-                <span key={c} className="tag-badge">{c}</span>
+            <h2>Additional columns detected</h2>
+            <p className="hint">These columns aren't part of the standard output. Select the ones you'd like to keep:</p>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', margin: '1.5rem 0' }}>
+              {extraCols.map(col => (
+                <label key={col.norm} style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', cursor: 'pointer', padding: '0.6rem 0.75rem', borderRadius: '6px', backgroundColor: selectedExtraCols.has(col.norm) ? 'rgba(76, 175, 80, 0.1)' : 'transparent', border: selectedExtraCols.has(col.norm) ? '1px solid rgba(76, 175, 80, 0.3)' : '1px solid rgba(255,255,255,0.1)', transition: 'all 0.2s' }}>
+                  <input
+                    type="checkbox"
+                    checked={selectedExtraCols.has(col.norm)}
+                    onChange={(e) => {
+                      setSelectedExtraCols(prev => {
+                        const next = new Set(prev)
+                        if (e.target.checked) next.add(col.norm)
+                        else next.delete(col.norm)
+                        return next
+                      })
+                    }}
+                    style={{ cursor: 'pointer', width: '1rem', height: '1rem' }}
+                  />
+                  <span style={{ fontWeight: 500 }}>{col.raw}</span>
+                </label>
               ))}
             </div>
-            <p className="tag-question">Would you like to keep these columns in the export?</p>
             <div className="btn-row">
-              <button className="btn btn-primary" onClick={() => confirmTags(true)}>Keep tags</button>
-              <button className="btn btn-ghost" onClick={() => confirmTags(false)}>Drop tags</button>
+              <button className="btn btn-primary" onClick={confirmExtraCols}>Continue</button>
+              <button className="btn btn-ghost" onClick={() => confirmExtraCols(new Set())}>Keep none</button>
             </div>
           </div>
         )}
