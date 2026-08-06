@@ -455,7 +455,7 @@ export default function App() {
               ))}
             </div>
             <div className="btn-row">
-              <button className="btn btn-primary" onClick={confirmExtraCols}>Continue</button>
+              <button className="btn btn-primary" onClick={() => confirmExtraCols()}>Continue</button>
               <button className="btn btn-ghost" onClick={() => confirmExtraCols(new Set())}>Keep none</button>
             </div>
           </div>
