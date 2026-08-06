@@ -224,9 +224,9 @@ export default function App() {
     const reader = new FileReader()
     reader.onload = (e) => {
       const data = new Uint8Array(e.target.result)
-      const wb = XLSX.read(data, { type: 'array' })
+      const wb = XLSX.read(data, { type: 'array', cellText: true })
       const ws = wb.Sheets[wb.SheetNames[0]]
-      let rows = XLSX.utils.sheet_to_json(ws, { defval: '' })
+      let rows = XLSX.utils.sheet_to_json(ws, { defval: '', raw: false })
       if (!rows.length) return
 
       let headers = Object.keys(rows[0])
