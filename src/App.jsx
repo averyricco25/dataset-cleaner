@@ -1,111 +1,614 @@
-import { useRef, useState } from 'react'
-import { cleanRows, FIELDS, sheetData, suggestMapping } from './cleaner'
+import { useState, useCallback } from 'react'
+import * as XLSX from 'xlsx'
 import './App.css'
 
-const initialOptions = { contact: 'phone', country: 'US', requireName: true, splitNames: true, multi: 'valid', dedupe: 'phone', keep: 'complete', extra: [] }
-const PAGE_SIZE = 20
+const CORE_COLS = ['first_name', 'last_name', 'phone', 'email']
+
+function normalizeHeader(h) {
+  return h.toLowerCase().trim().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '')
+}
+
+// Find the first header key that matches any of the given patterns
+function findCol(headers, patterns) {
+  return headers.find(h => patterns.some(p => h === p || h.includes(p)))
+}
+
+function formatE164(raw) {
+  if (!raw) return null
+  const digits = String(raw).replace(/\D/g, '')
+  // Only accept valid US/Canada phone numbers
+  if (digits.length === 10) return '+1' + digits
+  if (digits.length === 11 && digits[0] === '1') return '+' + digits
+  return null
+}
+
+function firstValue(val) {
+  if (val == null) return ''
+  const s = String(val).trim()
+  return s.split(/[;|,]/)[0].trim()
+}
+
+function normalizeNameCase(name) {
+  if (!name) return name
+  const letters = name.replace(/[^a-z]/gi, '')
+  if (!letters) return name
+  const isAllCaps = letters === letters.toUpperCase()
+  if (!isAllCaps) return name
+  return name.split(/\s+/).map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()).join(' ')
+}
+
+function parseName(row, normHeaders, rawHeaders) {
+  const fnKey = findCol(normHeaders, ['first_name', 'firstname', 'first', 'fname', 'given_name'])
+  const lnKey = findCol(normHeaders, ['last_name', 'lastname', 'last', 'lname', 'surname', 'family_name'])
+
+  // If both first and last name columns exist AND have values, use them
+  if (fnKey && lnKey && firstValue(row[fnKey])) {
+    return { first_name: normalizeNameCase(firstValue(row[fnKey])), last_name: normalizeNameCase(firstValue(row[lnKey])) }
+  }
+
+  // If only first name exists and has value, use it with empty last name
+  if (fnKey && firstValue(row[fnKey]) && !lnKey) {
+    return { first_name: normalizeNameCase(firstValue(row[fnKey])), last_name: '' }
+  }
+
+  // Try to find a display/business/organization name column as fallback
+  // More specific patterns first, and exclude fnKey/lnKey to avoid matching those again
+  const fullKey = findCol(normHeaders.filter((h, i) => h !== fnKey && h !== lnKey), ['display_name', 'displayname', 'organization_name', 'business_name', 'org_name', 'company_name', 'business', 'full_name', 'fullname', 'contact_name', 'customer_name', 'client_name', 'name'])
+  if (fullKey && row[fullKey]) {
+    const full = String(row[fullKey]).trim()
+
+    // Check if it's a comma-separated name (likely "Last, First")
+    if (full.includes(',')) {
+      const [last, first] = full.split(',').map(s => s.trim())
+      return { first_name: normalizeNameCase(first || ''), last_name: normalizeNameCase(last || '') }
+    }
+
+    // Check if it looks like a business name (has business keywords)
+    const businessKeywords = /\b(inc|llc|corp|co\.|ltd|company|contractors|services|group|associates|partners|llp|pllc|agency|solutions|systems|networks|studios|works|house|store|shop|market|center|park|plaza|village)\b/i
+    const hasBusinessKeyword = businessKeywords.test(full)
+    const words = full.trim().split(/\s+/)
+
+    // If it has business keywords, treat as business name
+    if (hasBusinessKeyword) {
+      return { first_name: normalizeNameCase(full), last_name: '' }
+    }
+
+    // For names with multiple words, split into first and last
+    // The last word becomes last_name, everything else (including "&") is first_name
+    if (words.length >= 2) {
+      const lastName = words[words.length - 1]
+      const firstName = words.slice(0, -1).join(' ')
+      return { first_name: normalizeNameCase(firstName), last_name: normalizeNameCase(lastName) }
+    }
+
+    // Single word - default to first name only
+    return { first_name: normalizeNameCase(full), last_name: '' }
+  }
+
+  return { first_name: '', last_name: '' }
+}
+
+function getExtraCols(rawHeaders, normHeaders) {
+  const fnKey = findCol(normHeaders, ['first_name', 'firstname', 'first', 'fname', 'given_name'])
+  const lnKey = findCol(normHeaders, ['last_name', 'lastname', 'last', 'lname', 'surname', 'family_name'])
+  const fullKey = findCol(
+    normHeaders.filter(h => h !== fnKey && h !== lnKey),
+    ['display_name', 'displayname', 'organization_name', 'business_name', 'org_name', 'company_name', 'business', 'full_name', 'fullname', 'contact_name', 'customer_name', 'client_name', 'name']
+  )
+  const phoneKey = findCol(normHeaders, ['phone', 'phone_number', 'phonenumber', 'mobile', 'cell', 'telephone', 'cell_phone', 'mobile_phone', 'contact_phone'])
+  const emailKey = findCol(normHeaders, ['email', 'email_address', 'emailaddress', 'e_mail'])
+  const coreNormKeys = new Set([fnKey, lnKey, fullKey, phoneKey, emailKey].filter(Boolean))
+  return rawHeaders
+    .map((raw, i) => ({ raw, norm: normHeaders[i] }))
+    .filter(({ norm }) => !coreNormKeys.has(norm))
+}
+
+function cleanData(rows, rawHeaders, extraColsToKeep, prioritizeEmail) {
+  const normHeaders = rawHeaders.map(normalizeHeader)
+
+  const summary = {
+    started: rows.length,
+    missingName: 0,
+    missingPhone: 0,
+    badPhone: 0,
+    duplicate: 0,
+    emailOnly: 0,
+    final: 0,
+  }
+
+  const seenPhones = new Set()
+  const cleaned = []
+  const removed = []
+
+  // Find phone and email columns once
+  const phoneKey = findCol(normHeaders, ['phone', 'phone_number', 'phonenumber', 'mobile', 'cell', 'telephone', 'cell_phone', 'mobile_phone', 'contact_phone'])
+  const emailKey = findCol(normHeaders, ['email', 'email_address', 'emailaddress', 'e_mail'])
+
+  for (const rawRow of rows) {
+    const row = {}
+    rawHeaders.forEach((h, i) => { row[normHeaders[i]] = rawRow[h] })
+
+    const { first_name, last_name } = parseName(row, normHeaders, rawHeaders)
+
+    if (!first_name) {
+      summary.missingName++
+      removed.push({ ...row, _reason: 'Missing first name' })
+      continue
+    }
+
+    const phoneRaw = phoneKey ? firstValue(row[phoneKey]) : ''
+    const phone = formatE164(phoneRaw)
+    const emailRaw = emailKey ? (row[emailKey] || '') : ''
+    const email = firstValue(emailRaw)
+
+    const hasPhone = !!phoneRaw
+    const hasValidPhone = !!phone
+    const hasEmail = !!email
+
+    // Check phone requirement
+    if (!hasPhone) {
+      if (prioritizeEmail && hasEmail) {
+        // Email-only contact is allowed
+        summary.emailOnly++
+      } else {
+        summary.missingPhone++
+        removed.push({ ...row, _reason: 'Missing phone and email' })
+        continue
+      }
+    } else if (!hasValidPhone) {
+      if (prioritizeEmail && hasEmail) {
+        // Invalid phone but has email - keep it
+        summary.emailOnly++
+      } else {
+        summary.badPhone++
+        removed.push({ ...row, _reason: 'Invalid phone format' })
+        continue
+      }
+    } else if (seenPhones.has(phone)) {
+      summary.duplicate++
+      removed.push({ ...row, _reason: 'Duplicate phone' })
+      continue
+    } else {
+      seenPhones.add(phone)
+    }
+
+    const out = { first_name, last_name, phone, email }
+
+    extraColsToKeep.forEach(col => {
+      out[col.raw] = firstValue(String(row[col.norm] ?? ''))
+    })
+
+    cleaned.push(out)
+  }
+
+  summary.final = cleaned.length
+  return { cleaned, removed, summary }
+}
+
+function exportCSV(data, filename) {
+  const ws = XLSX.utils.json_to_sheet(data)
+  const csv = XLSX.utils.sheet_to_csv(ws)
+  const blob = new Blob([csv], { type: 'text/csv' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+function exportXLSX(data, filename) {
+  const ws = XLSX.utils.json_to_sheet(data)
+  const wb = XLSX.utils.book_new()
+  XLSX.utils.book_append_sheet(wb, ws, 'Cleaned')
+  XLSX.writeFile(wb, filename)
+}
 
 export default function App() {
-  const input = useRef(null), request = useRef(0)
-  const [stage, setStage] = useState(0)
+  const [stage, setStage] = useState('upload') // upload | extra-cols | result
+  const [dragOver, setDragOver] = useState(false)
   const [fileName, setFileName] = useState('')
-  const [sheets, setSheets] = useState({})
-  const [sheet, setSheet] = useState('')
-  const [headerRow, setHeaderRow] = useState(0)
-  const [data, setData] = useState({ headers: [], rows: [] })
-  const [mapping, setMapping] = useState({})
-  const [options, setOptions] = useState(initialOptions)
-  const [results, setResults] = useState([])
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState('')
-  const [query, setQuery] = useState('')
-  const [filter, setFilter] = useState('all')
-  const [page, setPage] = useState(0)
-  const [details, setDetails] = useState(null)
-  const [drag, setDrag] = useState(false)
-  const option = (key, value) => setOptions(prev => ({ ...prev, [key]: value }))
-  function configure(matrix, row = 0) {
-    const next = sheetData(matrix, row)
-    const suggested = suggestMapping(next.headers)
-    setData(next); setMapping(suggested); setHeaderRow(row)
-    setOptions(prev => ({ ...prev, extra: next.headers.map((_, i) => i).filter(i => !Object.values(suggested).includes(String(i))) }))
-  }
-  async function load(file) {
-    if (!file) return
-    const token = ++request.current
-    setBusy(true); setError(''); setFileName(''); setSheets({}); setData({ headers: [], rows: [] }); setResults([]); setStage(0)
-    try {
-      if (!/\.(csv|xlsx|xls)$/i.test(file.name)) throw new Error('Choose a CSV, XLSX, or XLS file.')
-      if (file.size > 25 * 1024 * 1024) throw new Error('This file exceeds 25 MB. Split it into smaller files and try again.')
-      const XLSX = await import('xlsx')
-      const buffer = await file.arrayBuffer()
-      if (token !== request.current) return
-      const workbook = XLSX.read(buffer, { type: 'array', cellText: true })
-      const parsed = Object.fromEntries(workbook.SheetNames.map(name => [name, XLSX.utils.sheet_to_json(workbook.Sheets[name], { header: 1, defval: '', raw: false, blankrows: true })]))
-      const first = workbook.SheetNames.find(name => parsed[name].some(row => row.some(v => String(v).trim())))
-      if (!first) throw new Error('This file is empty. Add a header row and at least one contact.')
-      setSheets(parsed); setSheet(first); configure(parsed[first]); setFileName(file.name); setStage(1)
-    } catch (e) { if (token === request.current) setError(e.message || 'Could not read this file. Try exporting it as CSV.') }
-    finally { if (token === request.current) setBusy(false); if (input.current) input.current.value = '' }
-  }
-  const used = Object.values(mapping).filter(v => v !== '-1')
-  const mappingError = new Set(used).size !== used.length ? 'Map each source column to only one field.' : options.requireName && mapping.first_name === '-1' && mapping.full_name === '-1' ? 'Map a first name or full name column, or turn off the name requirement.' : options.contact === 'phone' && mapping.phone === '-1' ? 'Map a phone column for this contact rule.' : options.contact === 'email' && mapping.email === '-1' ? 'Map an email column for this contact rule.' : options.contact === 'either' && mapping.phone === '-1' && mapping.email === '-1' ? 'Map a phone or email column.' : ''
-  async function run() {
-    setBusy(true); setError('')
-    await new Promise(resolve => setTimeout(resolve, 30))
-    try { setResults(cleanRows(data.rows, data.headers, mapping, options)); setStage(2); setPage(0); setQuery(''); setFilter('all'); setDetails(null) }
-    catch { setError('Cleaning failed. Check the selected worksheet and columns, then try again.') }
-    finally { setBusy(false) }
-  }
-  const kept = results.filter(r => !r.reason || r.restored)
-  const removed = results.filter(r => r.reason && !r.restored)
-  const filtered = results.filter(r => (filter === 'all' || (filter === 'kept' ? !r.reason || r.restored : filter === 'removed' ? r.reason && !r.restored : r.warnings.length > 0)) && `${r.id} ${r.reason} ${r.warnings.join(' ')} ${r.cells.join(' ')} ${Object.values(r.output).join(' ')}`.toLowerCase().includes(query.toLowerCase()))
-  const pages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE))
-  const currentPage = Math.min(page, pages - 1)
-  async function download(kind, format = 'csv') {
-    setBusy(true); setError('')
-    try {
-      const XLSX = await import('xlsx')
-      const source = kind === 'cleaned' ? kept : kind === 'removed' ? removed : results
-      const headers = kind === 'cleaned' ? Object.keys(source[0]?.output || {}) : ['Source row', 'Status', 'Reason', 'Warnings', ...data.headers.map((h, i) => `${h} [${i + 1}]`)]
-      const rows = source.map(r => kind === 'cleaned' ? headers.map(h => r.output[h]) : [r.id, r.restored ? 'Restored' : r.reason ? 'Removed' : 'Kept', r.reason, r.warnings.join('; '), ...r.cells])
-      const ws = XLSX.utils.aoa_to_sheet([headers, ...rows])
-      const base = fileName.replace(/\.[^.]+$/, '')
-      if (format === 'xlsx') { const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, 'Contacts'); XLSX.writeFile(wb, `${base}_${kind}.xlsx`) }
-      else {
-        // Escape spreadsheet formula prefixes in CSV; XLSX exports preserve string cells.
-        const safe = XLSX.utils.aoa_to_sheet([headers, ...rows].map(row => row.map(v => typeof v === 'string' && /^[\s]*[=+@-]/.test(v) ? `'${v}` : v)))
-        const url = URL.createObjectURL(new Blob(['\ufeff', XLSX.utils.sheet_to_csv(safe)], { type: 'text/csv;charset=utf-8' }))
-        const a = document.createElement('a'); a.href = url; a.download = `${base}_${kind}.csv`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000)
+  const [selectedFile, setSelectedFile] = useState(null)
+  const [rawRows, setRawRows] = useState([])
+  const [rawHeaders, setRawHeaders] = useState([])
+  const [extraCols, setExtraCols] = useState([])
+  const [selectedExtraCols, setSelectedExtraCols] = useState(new Set())
+  const [prioritizeEmail, setPrioritizeEmail] = useState(false)
+  const [cleanedRows, setCleanedRows] = useState([])
+  const [removedRows, setRemovedRows] = useState([])
+  const [summary, setSummary] = useState(null)
+  const [showRemoved, setShowRemoved] = useState(false)
+
+  const parseFile = useCallback((file) => {
+    setFileName(file.name)
+    const reader = new FileReader()
+    reader.onload = (e) => {
+      const data = new Uint8Array(e.target.result)
+      const wb = XLSX.read(data, { type: 'array', cellText: true })
+      const ws = wb.Sheets[wb.SheetNames[0]]
+      let rows = XLSX.utils.sheet_to_json(ws, { defval: '', raw: false })
+      if (!rows.length) return
+
+      let headers = Object.keys(rows[0])
+
+      // Check if first data row looks like column headers
+      const firstRow = rows[0]
+      const firstRowValues = Object.values(firstRow)
+      const looksLikeHeaders = firstRowValues.some(v => /^(first|last|name|phone|email|mobile|contact)/i.test(String(v).trim()))
+
+      if (looksLikeHeaders) {
+        // Use first row values as headers and remove it from data
+        headers = firstRowValues.map(v => String(v).trim())
+        rows = rows.slice(1).map(row => {
+          const newRow = {}
+          headers.forEach((h, i) => {
+            const oldKey = Object.keys(row)[i]
+            newRow[h] = row[oldKey] || ''
+          })
+          return newRow
+        })
       }
-      setStage(3)
-    } catch { setError('Export failed. Please try again.') }
-    finally { setBusy(false) }
+
+      // Store file data but don't process yet
+      setSelectedFile({ rows, headers })
+    }
+    reader.readAsArrayBuffer(file)
+  }, [])
+
+  const processFile = () => {
+    if (!selectedFile || !fileName) {
+      return
+    }
+
+    const { rows, headers } = selectedFile
+    setRawRows(rows)
+    setRawHeaders(headers)
+
+    const normHeaders = headers.map(normalizeHeader)
+    const cols = getExtraCols(headers, normHeaders)
+    setExtraCols(cols)
+
+    if (cols.length > 0) {
+      setSelectedExtraCols(new Set(cols.map(c => c.norm)))
+      setStage('extra-cols')
+    } else {
+      const { cleaned, removed, summary } = cleanData(rows, headers, [], prioritizeEmail)
+      setCleanedRows(cleaned)
+      setRemovedRows(removed)
+      setSummary(summary)
+      setStage('result')
+    }
   }
-  function reset() { request.current++; setStage(0); setFileName(''); setSheets({}); setData({ headers: [], rows: [] }); setResults([]); setError(''); setDetails(null); setBusy(false) }
-  return <div className="app">
-    <header className="header"><div className="header-inner"><span className="logo-mark">◈</span><div><h1>Contact List Cleaner</h1><span className="subtitle">for Relentless Digital</span></div><span className="privacy">Files stay in your browser</span></div></header>
-    <main className="main">
-      <nav aria-label="Progress" className="steps">{['Upload', 'Configure', 'Review', 'Export'].map((label, i) => <span key={label} aria-current={stage === i ? 'step' : undefined} className={stage >= i ? 'active' : ''}><b>{i + 1}</b>{label}</span>)}</nav>
-      {error && <div role="alert" className="error">{error}</div>}
-      {busy && <p role="status" className="notice">Processing your file…</p>}
-      <input ref={input} type="file" accept=".csv,.xlsx,.xls" className="sr-only" tabIndex={-1} onChange={e => load(e.target.files[0])} />
-      {stage === 0 ? <section className="card upload-card"><span className="eyebrow">A cleaner list. A clearer next step.</span><h2>Get your contacts ready to use</h2><p className="hint">Map your columns, choose your rules, and review every change before exporting.</p><button disabled={busy} className={`dropzone ${drag ? 'dragover' : ''}`} onClick={() => input.current.click()} onDragOver={e => { e.preventDefault(); setDrag(true) }} onDragLeave={() => setDrag(false)} onDrop={e => { e.preventDefault(); setDrag(false); if (!busy) load(e.dataTransfer.files[0]) }}><span className="drop-icon">↑</span><strong>Drop your contact list here</strong><span>or browse files · CSV, XLSX, XLS · up to 25 MB</span></button><div className="intro-grid"><div><h3>Keep the context</h3><p>Notes and extra columns stay intact.</p></div><div><h3>Stay in control</h3><p>Review removals and restore contacts.</p></div><div><h3>Export with confidence</h3><p>Download your contacts and audit trail.</p></div></div></section> : <>
-      <div className="file-bar"><div><strong>{fileName}</strong><span>{data.rows.length.toLocaleString()} contacts · {data.headers.length} columns</span></div><button className="btn btn-ghost" disabled={busy} onClick={reset}>New file</button></div>
-      {stage === 1 ? <>
-        <section className="card"><h2>Confirm your columns</h2><p className="hint">We suggest exact header matches. Check the examples and adjust any field before cleaning.</p><div className="two-col"><label>Worksheet<select value={sheet} onChange={e => { setSheet(e.target.value); configure(sheets[e.target.value]) }}>{Object.keys(sheets).map(name => <option key={name}>{name}</option>)}</select></label><label>Header row<input type="number" min="1" max={Math.max(1, sheets[sheet]?.length || 1)} value={headerRow + 1} onChange={e => configure(sheets[sheet], Math.max(0, Math.min((sheets[sheet]?.length || 1) - 1, Number(e.target.value) - 1)))} /></label></div><div className="mapping-grid">{Object.entries(FIELDS).map(([key, label]) => <label key={key}>{label}<select value={mapping[key] ?? '-1'} onChange={e => setMapping(prev => ({ ...prev, [key]: e.target.value }))}><option value="-1">Not mapped</option>{data.headers.map((h, i) => <option value={i} key={i}>{i + 1}. {h}</option>)}</select><small>{data.rows.slice(0, 2).map(r => r.cells[Number(mapping[key])]).filter(Boolean).join(' · ') || 'No sample value'}</small></label>)}</div>{!data.rows.length && <p className="error">No contacts below this header. Select another worksheet or header row.</p>}</section>
-        <section className="card"><h2>Choose your cleaning rules</h2><p className="hint">Invalid values are flagged. Validation checks format and numbering rules, not whether a contact is reachable.</p><div className="two-col"><label>Contact requirement<select value={options.contact} onChange={e => option('contact', e.target.value)}><option value="phone">Valid phone required</option><option value="either">Allow email-only contacts</option><option value="email">Valid email required</option></select></label><label>Default phone country<select value={options.country} onChange={e => option('country', e.target.value)}><option value="US">United States</option><option value="CA">Canada</option><option value="GB">United Kingdom</option><option value="AU">Australia</option></select><small>International numbers with + use their own country code.</small></label><label>Find duplicates by<select value={options.dedupe} onChange={e => option('dedupe', e.target.value)}><option value="phone">Phone and extension</option><option value="email">Email</option><option value="either">Phone or email</option><option value="none">Keep all (shared numbers allowed)</option></select></label><label>When duplicates match<select value={options.keep} onChange={e => option('keep', e.target.value)}><option value="complete">Keep the most complete contact</option><option value="first">Keep the first contact</option></select></label><label>Multiple phones or emails<select value={options.multi} onChange={e => option('multi', e.target.value)}><option value="valid">Use the first valid value</option><option value="first">Use only the first value</option></select><small>Original values remain available in review and audit exports.</small></label></div><label className="check"><input type="checkbox" checked={options.requireName} onChange={e => option('requireName', e.target.checked)} />Require a first name</label><label className="check"><input type="checkbox" checked={options.splitNames} onChange={e => option('splitNames', e.target.checked)} />Split full names into first and last name</label><p className="hint">Business names with common company suffixes stay together. Turn splitting off for other business names or names you want to preserve.</p></section>
-        <section className="card"><h2>Keep additional columns</h2><p className="hint">Selected columns retain their complete original text, including commas and line breaks.</p><div className="extra-grid">{data.headers.map((h, i) => <label className="check" key={i}><input type="checkbox" checked={options.extra.includes(i)} onChange={e => option('extra', e.target.checked ? [...options.extra, i] : options.extra.filter(n => n !== i))} />{i + 1}. {h}</label>)}</div></section>
-        {mappingError && <p role="alert" className="error">{mappingError}</p>}<div className="action-row"><button className="btn btn-primary" disabled={busy || !!mappingError || !data.rows.length} onClick={run}>Clean and review →</button></div>
-      </> : <>
-        <div className="review-title"><div><h2>{stage === 3 ? 'Your export is ready' : 'Review your cleaned list'}</h2><p className="hint">Your original file is unchanged. Review flagged rows before using your list.</p></div><button className="btn btn-ghost" disabled={busy} onClick={() => setStage(1)}>Change settings</button></div>
-        <div className="stats-grid">{[[results.length, 'Original contacts'], [kept.length, 'Ready to export'], [removed.length, 'Removed'], [results.filter(r => r.warnings.length).length, 'With warnings']].map(([n, label]) => <div className="stat" key={label}><span className="stat-num">{n.toLocaleString()}</span><span className="stat-label">{label}</span></div>)}</div>
-        <section className="card review-card"><div className="toolbar"><label className="search">Search contacts<input type="search" placeholder="Name, email, phone, or reason…" value={query} onChange={e => { setQuery(e.target.value); setPage(0) }} /></label><label>Show<select value={filter} onChange={e => { setFilter(e.target.value); setPage(0) }}><option value="all">All contacts</option><option value="kept">Kept</option><option value="removed">Removed</option><option value="warnings">With warnings</option></select></label></div><div className="table-wrap"><table><thead><tr><th>Source row</th><th>Contact</th><th>Phone</th><th>Email</th><th>Status / reason</th><th>Actions</th></tr></thead><tbody>{filtered.slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE).map(r => <tr key={r.id}><td>{r.id}</td><td>{r.output.first_name} {r.output.last_name}</td><td>{r.output.phone || '—'}{r.output.phone_extension && ` ext ${r.output.phone_extension}`}</td><td>{r.output.email || '—'}</td><td><span className={`badge ${r.reason && !r.restored ? 'removed' : ''}`}>{r.restored ? 'Restored' : r.reason || 'Kept'}</span>{r.warnings.length > 0 && <small className="warning">{r.warnings.join(' · ')}</small>}</td><td><button className="text-btn" onClick={() => setDetails(r.id)}>Compare</button>{r.reason && <button className="text-btn" onClick={() => setResults(prev => prev.map(item => item.id === r.id ? { ...item, restored: !item.restored } : item))}>{r.restored ? 'Undo restore' : 'Restore'}</button>}</td></tr>)}</tbody></table>{!filtered.length && <p className="empty">No contacts match this view.</p>}</div><div className="pagination"><span>{filtered.length} contacts · Page {currentPage + 1} of {pages}</span><button className="btn btn-ghost" disabled={currentPage === 0} onClick={() => setPage(currentPage - 1)}>Previous</button><button className="btn btn-ghost" disabled={currentPage >= pages - 1} onClick={() => setPage(currentPage + 1)}>Next</button></div></section>
-        {details !== null && (() => { const row = results.find(r => r.id === details); return <section className="card"><div className="review-title"><h2>Source row {details}: before and after</h2><button className="btn btn-ghost" onClick={() => setDetails(null)}>Close comparison</button></div><div className="two-col"><div><h3>Original values</h3><dl>{data.headers.map((h, i) => <div key={i}><dt>{h}</dt><dd>{row.cells[i] || '—'}</dd></div>)}</dl></div><div><h3>Export values</h3><dl>{Object.entries(row.output).map(([k, v]) => <div key={k}><dt>{k}</dt><dd>{v || '—'}</dd></div>)}</dl></div></div>{row.reason && <p className="notice">{row.reason}. Restoring includes this row even if it fails a rule; invalid phone/email values stay blank. Original values are preserved in the audit export.</p>}</section> })()}
-        <section className="card"><h2>Export your results</h2><p className="hint">{kept.length} contacts ready. CSV uses an apostrophe before formula-like values (including + phones) for spreadsheet safety. XLSX preserves phones as text without that prefix.</p><div className="action-row"><button className="btn btn-primary" disabled={busy || !kept.length} onClick={() => download('cleaned', 'xlsx')}>Export XLSX</button><button className="btn btn-secondary" disabled={busy || !kept.length} onClick={() => download('cleaned')}>Export CSV</button><button className="btn btn-ghost" disabled={busy || !removed.length} onClick={() => download('removed')}>Removed rows + reasons</button><button className="btn btn-ghost" disabled={busy || !results.length} onClick={() => download('audit')}>Full audit CSV</button></div></section>
-      </>}
-      </>}
-      <footer>Processed on this device · No contact uploads · Original files stay untouched</footer>
-    </main>
-  </div>
+
+  const onDrop = useCallback((e) => {
+    e.preventDefault()
+    setDragOver(false)
+    const file = e.dataTransfer.files[0]
+    if (file) parseFile(file)
+  }, [parseFile])
+
+  const onFileInput = (e) => {
+    const file = e.target.files[0]
+    if (file) parseFile(file)
+  }
+
+  const confirmExtraCols = (overrideSelection) => {
+    const sel = overrideSelection ?? selectedExtraCols
+    const toKeep = extraCols.filter(c => sel.has(c.norm))
+    const { cleaned, removed, summary } = cleanData(rawRows, rawHeaders, toKeep, prioritizeEmail)
+    setCleanedRows(cleaned)
+    setRemovedRows(removed)
+    setSummary(summary)
+    setStage('result')
+  }
+
+  const handleExport = () => {
+    const base = fileName.replace(/\.[^.]+$/, '')
+    exportCSV(cleanedRows, `${base}_cleaned.csv`)
+  }
+
+  const handleExportXLSX = () => {
+    const base = fileName.replace(/\.[^.]+$/, '')
+    exportXLSX(cleanedRows, `${base}_cleaned.xlsx`)
+  }
+
+  const reset = () => {
+    setStage('upload')
+    setFileName('')
+    setRawRows([])
+    setRawHeaders([])
+    setExtraCols([])
+    setSelectedExtraCols(new Set())
+    setCleanedRows([])
+    setRemovedRows([])
+    setSummary(null)
+    setShowRemoved(false)
+  }
+
+  return (
+    <div className="app">
+      <header className="header">
+        <div className="header-inner">
+          <span className="logo-mark">◈</span>
+          <h1>Contact List Cleaner</h1>
+          <span className="subtitle">for Relentless Digital</span>
+        </div>
+      </header>
+
+      <main className="main">
+        {stage === 'upload' && (
+          <div className="card upload-card">
+            <h2>Upload your contact list</h2>
+            <p className="hint">Accepts CSV, XLSX, or XLS</p>
+            <div
+              className={`dropzone${dragOver ? ' dragover' : ''}`}
+              onDragOver={(e) => { e.preventDefault(); setDragOver(true) }}
+              onDragLeave={() => setDragOver(false)}
+              onDrop={onDrop}
+              onClick={() => document.getElementById('file-input').click()}
+            >
+              {selectedFile && fileName ? (
+                <>
+                  <div className="drop-icon" style={{ fontSize: '2rem', color: '#4caf50' }}>✓</div>
+                  <p style={{ margin: '0.5rem 0 0 0', fontWeight: 500 }}>{fileName}</p>
+                  <p className="drop-sub">Ready to clean</p>
+                </>
+              ) : (
+                <>
+                  <div className="drop-icon">↑</div>
+                  <p>Drag & drop your file here</p>
+                  <p className="drop-sub">or click to browse</p>
+                </>
+              )}
+              <input
+                id="file-input"
+                type="file"
+                accept=".csv,.xlsx,.xls"
+                style={{ display: 'none' }}
+                onChange={onFileInput}
+              />
+            </div>
+            <div className="rules-list">
+              <h3>Cleaning rules applied</h3>
+              <ul>
+                <li>Split full names into first / last columns</li>
+                <li>Format phones to E.164 (+1XXXXXXXXXX)</li>
+                <li>Keep only first value in multi-value cells</li>
+                <li>Remove rows missing first name or phone</li>
+                <li>Deduplicate by phone (keep first occurrence)</li>
+                <li>Drop irrelevant columns</li>
+              </ul>
+            </div>
+
+            <div style={{ marginTop: '2rem', paddingTop: '2rem', borderTop: '1px solid rgba(255,255,255,0.1)' }}>
+              <p className="tag-question">Contact method priority:</p>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                <label style={{ display: 'flex', alignItems: 'flex-start', gap: '0.75rem', cursor: 'pointer', padding: '0.75rem', borderRadius: '6px', backgroundColor: !prioritizeEmail ? 'rgba(76, 175, 80, 0.1)' : 'transparent', border: !prioritizeEmail ? '1px solid rgba(76, 175, 80, 0.3)' : '1px solid rgba(255,255,255,0.1)', transition: 'all 0.2s' }}>
+                  <input
+                    type="radio"
+                    name="contactMethod"
+                    checked={!prioritizeEmail}
+                    onChange={() => setPrioritizeEmail(false)}
+                    style={{ marginTop: '0.25rem', cursor: 'pointer' }}
+                  />
+                  <div>
+                    <p style={{ margin: '0 0 0.25rem 0', fontWeight: 500 }}>Phone required</p>
+                    <p className="hint" style={{ margin: 0 }}>Removes any contacts missing a valid phone number</p>
+                  </div>
+                </label>
+                <label style={{ display: 'flex', alignItems: 'flex-start', gap: '0.75rem', cursor: 'pointer', padding: '0.75rem', borderRadius: '6px', backgroundColor: prioritizeEmail ? 'rgba(76, 175, 80, 0.1)' : 'transparent', border: prioritizeEmail ? '1px solid rgba(76, 175, 80, 0.3)' : '1px solid rgba(255,255,255,0.1)', transition: 'all 0.2s' }}>
+                  <input
+                    type="radio"
+                    name="contactMethod"
+                    checked={prioritizeEmail}
+                    onChange={() => setPrioritizeEmail(true)}
+                    style={{ marginTop: '0.25rem', cursor: 'pointer' }}
+                  />
+                  <div>
+                    <p style={{ margin: '0 0 0.25rem 0', fontWeight: 500 }}>Prioritize email</p>
+                    <p className="hint" style={{ margin: 0 }}>Keeps contacts that have email addresses, even without phone numbers (useful for email campaigns)</p>
+                  </div>
+                </label>
+              </div>
+            </div>
+
+            <div style={{ marginTop: '2rem', paddingTop: '2rem', borderTop: '1px solid rgba(255,255,255,0.1)' }}>
+              <button
+                className={`btn btn-lg ${selectedFile ? 'btn-primary' : 'btn-ghost'}`}
+                onClick={processFile}
+                disabled={!selectedFile}
+                style={{
+                  width: '100%',
+                  opacity: selectedFile ? 1 : 0.4,
+                  cursor: selectedFile ? 'pointer' : 'not-allowed',
+                  pointerEvents: selectedFile ? 'auto' : 'none'
+                }}
+              >
+                Clean this file
+              </button>
+            </div>
+          </div>
+        )}
+
+        {stage === 'extra-cols' && (
+          <div className="card tag-card">
+            <h2>Additional columns detected</h2>
+            <p className="hint">These columns aren't part of the standard output. Select the ones you'd like to keep:</p>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', margin: '1.5rem 0' }}>
+              {extraCols.map(col => (
+                <label key={col.norm} style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', cursor: 'pointer', padding: '0.6rem 0.75rem', borderRadius: '6px', backgroundColor: selectedExtraCols.has(col.norm) ? 'rgba(76, 175, 80, 0.1)' : 'transparent', border: selectedExtraCols.has(col.norm) ? '1px solid rgba(76, 175, 80, 0.3)' : '1px solid rgba(255,255,255,0.1)', transition: 'all 0.2s' }}>
+                  <input
+                    type="checkbox"
+                    checked={selectedExtraCols.has(col.norm)}
+                    onChange={(e) => {
+                      setSelectedExtraCols(prev => {
+                        const next = new Set(prev)
+                        if (e.target.checked) next.add(col.norm)
+                        else next.delete(col.norm)
+                        return next
+                      })
+                    }}
+                    style={{ cursor: 'pointer', width: '1rem', height: '1rem' }}
+                  />
+                  <span style={{ fontWeight: 500 }}>{col.raw}</span>
+                </label>
+              ))}
+            </div>
+            <div className="btn-row">
+              <button className="btn btn-primary" onClick={() => confirmExtraCols()}>Continue</button>
+              <button className="btn btn-ghost" onClick={() => confirmExtraCols(new Set())}>Keep none</button>
+            </div>
+          </div>
+        )}
+
+        {stage === 'result' && summary && (
+          <div className="results">
+            <div className="card summary-card">
+              <h2>Cleaning Summary</h2>
+              <div className="stats-grid">
+                <div className="stat">
+                  <span className="stat-num">{summary.started}</span>
+                  <span className="stat-label">Rows started</span>
+                </div>
+                <div className="stat stat-removed">
+                  <span className="stat-num">{summary.started - summary.final}</span>
+                  <span className="stat-label">Rows removed</span>
+                </div>
+                <div className="stat stat-final">
+                  <span className="stat-num">{summary.final}</span>
+                  <span className="stat-label">Final rows</span>
+                </div>
+              </div>
+              <div className="breakdown">
+                <h3>Removed breakdown</h3>
+                <div className="breakdown-rows">
+                  {summary.missingName > 0 && (
+                    <div className="breakdown-row">
+                      <span>Missing first name</span>
+                      <span className="breakdown-num">{summary.missingName}</span>
+                    </div>
+                  )}
+                  {summary.missingPhone > 0 && (
+                    <div className="breakdown-row">
+                      <span>Missing phone and email</span>
+                      <span className="breakdown-num">{summary.missingPhone}</span>
+                    </div>
+                  )}
+                  {summary.badPhone > 0 && (
+                    <div className="breakdown-row">
+                      <span>Invalid phone format</span>
+                      <span className="breakdown-num">{summary.badPhone}</span>
+                    </div>
+                  )}
+                  {summary.duplicate > 0 && (
+                    <div className="breakdown-row">
+                      <span>Duplicate phone</span>
+                      <span className="breakdown-num">{summary.duplicate}</span>
+                    </div>
+                  )}
+                  {(summary.missingName + summary.missingPhone + summary.badPhone + summary.duplicate) === 0 && (
+                    <div className="breakdown-row">
+                      <span>No rows removed</span>
+                      <span className="breakdown-num">0</span>
+                    </div>
+                  )}
+                  {(summary.missingName + summary.missingPhone + summary.badPhone + summary.duplicate) > 0 && (
+                    <div className="breakdown-row" style={{ borderLeft: '3px solid #ef5350', paddingLeft: '0.75rem' }}>
+                      <span>Total removed</span>
+                      <span className="breakdown-num">{summary.missingName + summary.missingPhone + summary.badPhone + summary.duplicate}</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {summary.emailOnly > 0 && (
+                <div className="breakdown" style={{ marginTop: '1.5rem' }}>
+                  <h3>Kept (email-only)</h3>
+                  <p className="hint" style={{ marginBottom: '1rem' }}>These contacts were kept because they have email addresses but no phone numbers. This is due to the "Prioritize email" option you selected.</p>
+                  <div className="breakdown-rows">
+                    <div className="breakdown-row" style={{ color: '#64b5f6' }}>
+                      <span>Email-only contacts (no phone)</span>
+                      <span className="breakdown-num">{summary.emailOnly}</span>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="card preview-card">
+              <h2>Preview <span className="preview-note">(first 10 rows)</span></h2>
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      {cleanedRows.length > 0 && Object.keys(cleanedRows[0]).map(k => (
+                        <th key={k}>{k}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {cleanedRows.slice(0, 10).map((row, i) => (
+                      <tr key={i}>
+                        {Object.values(row).map((v, j) => (
+                          <td key={j}>{v}</td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {removedRows.length > 0 && (
+              <div className="card removed-card">
+                <div className="removed-header" onClick={() => setShowRemoved(v => !v)}>
+                  <h2>Removed Rows <span className="preview-note">({removedRows.length} total)</span></h2>
+                  <span className="toggle-icon">{showRemoved ? '▲' : '▼'}</span>
+                </div>
+                {showRemoved && (
+                  <div className="table-wrap">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Reason</th>
+                          {Object.keys(removedRows[0]).filter(k => k !== '_reason').slice(0, 5).map(k => (
+                            <th key={k}>{k}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {removedRows.slice(0, 10).map((row, i) => (
+                          <tr key={i} className="removed-row">
+                            <td><span className="reason-badge">{row._reason}</span></td>
+                            {Object.entries(row).filter(([k]) => k !== '_reason').slice(0, 5).map(([k, v]) => (
+                              <td key={k}>{String(v)}</td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    {removedRows.length > 10 && (
+                      <p className="table-more">…and {removedRows.length - 10} more removed rows</p>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div className="action-row">
+              <button className="btn btn-primary btn-lg" onClick={handleExport}>
+                ↓ Export CSV
+              </button>
+              <button className="btn btn-secondary btn-lg" onClick={handleExportXLSX}>
+                ↓ Export XLSX
+              </button>
+              <button className="btn btn-ghost" onClick={reset}>
+                Clean another file
+              </button>
+            </div>
+          </div>
+        )}
+      </main>
+    </div>
+  )
 }
